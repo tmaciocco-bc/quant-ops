@@ -1,6 +1,5 @@
 
 import time
-import pandas as pd
 
 # virtualenv enviroment_name -p python3
 
@@ -134,19 +133,19 @@ def write_db_procedures(procedure_type, client_order_id, algo_service_name, isin
 
 
 if __name__ == "__main__":
-    print(write_db_procedures(procedure_type="insert_order",
-                        client_order_id="b98a8739-20e4-4651-8630-7134adca2b78_manual_leg",
-                        algo_service_name="liquidity-algo-arb-btc-usd-bfx-binus",
-                        isin="BITFINEX_BTCUSD",
-                        order_price=34826.000000000,
-                        order_qty=-0.001200000,
-                        avg_px=34826.000000000,
-                        cum_qty=-0.001200000,
-                        leaves_qty=0.000000000,
-                        created_at=1611950517441362,
+    print(write_db_procedures(procedure_type="",
+                        client_order_id="",
+                        algo_service_name="",
+                        isin="",
+                        order_price=0,
+                        order_qty=0,
+                        avg_px=0,
+                        cum_qty=0,
+                        leaves_qty=0,
+                        created_at=0,
                         # updated_at=1611248896201110,
-                        exchange_client_order_id='UNKNOWN',
-                        order_id='UNKNOWN',
-                        tif=3,
-                        order_status=3,
+                        exchange_client_order_id="",
+                        order_id="",
+                        tif=0,
+                        order_status=0,
                         reason=""))
