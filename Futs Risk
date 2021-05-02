@@ -1,0 +1,174 @@
+-- NEXT GEN
+
+-- rename total_usd_tmp to total_usd , total_base_tmp to total_base
+-- unrealised pnl spot when position is closed out
+
+-- changes
+--     flipped base_equiv
+--     added else 0. for fees_tmp
+
+
+with trades as
+( select _id, period, algorithm_service_name, isin, instrument_type, cum_qty, avg_px, fees_tmp, usd_equiv, base_equiv,
+    sum(usd_equiv) over (partition by algorithm_service_name, isin order by _id) as total_usd_tmp, 
+    sum(base_equiv) over (partition by algorithm_service_name, isin order by _id) as total_base_tmp
+    
+from ( select _id, to_timestamp(created_at/1000000) as period, algorithm_service_name, isin,
+    case when isin like 'BINANCECM%' then 'Futures' else 'Spot' end as instrument_type,
+    cum_qty, avg_px, 
+    -- Binance futs: 4 taker (native)
+    -- Binance spot: 7.5 taker (usd)
+    case when isin like 'BINANCECM%' then .0004 * (abs(cum_qty::float) * {{contract_mult}} / avg_px::float) when isin like 'BINANCE%' then .00075 * abs(cum_qty::float) * avg_px::float else 0. end as fees_tmp,
+    case when isin like 'BINANCECM%' then -1. * cum_qty::float * {{contract_mult}} else -1. * cum_qty::float * avg_px::float end as usd_equiv, 
+    case when isin like 'BINANCECM%' then cum_qty::float * {{contract_mult}} / avg_px::float else cum_qty::float end as base_equiv
+from "liquidity_order_gateway"."order" 
+where cum_qty::float <> 0 
+    and (algorithm_service_name like '%liquidity-algo-basis-btcusd-m1-bin' 
+        or algorithm_service_name like '%liquidity-algo-basis-btcusd-u1-binancecm')
+    [[and to_timestamp(created_at/1000000) > to_timestamp({{start_date}}, 'Month DD, YYYY HH24:MI')]]
+    [[and to_timestamp(created_at/1000000) < to_timestamp({{end_date}}, 'Month DD, YYYY HH24:MI')]]
+order by period) as src ),
+
+
+------- ENTRY PRICE and REALIZED PNL
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- get yesterday's totals for entry
+trades2 as (
+select *, 
+    lag(total_usd_tmp, 1) over (partition by algorithm_service_name, isin order by _id) as total_usd, 
+    lag(total_base_tmp, 1) over (partition by algorithm_service_name, isin order by _id) as total_base from trades),
+    
+closed_trades as (
+select row_number() over (partition by algorithm_service_name, isin order by _id) as idx, * from trades2 
+where (instrument_type like '%Futures%' and cum_qty::float > 0) or (instrument_type like '%Spot%' and cum_qty::float < 0)),
+
+realized_pnl as (   with RECURSIVE rec AS (
+    -- anchor 
+    SELECT idx, _id, algorithm_service_name, isin, instrument_type, total_usd, total_base,
+        -- base * (mark - entry)
+        -- -1 * cum_qty to get positive val
+        case when instrument_type like '%Spot%' then -1. * base_equiv::float * (avg_px::float - (- total_usd::float / total_base::float)) else 0. end as realized_pnl_usd,
+        -- multiplier * notional usd * (1/entry - 1/mark)
+        case when instrument_type like '%Futures%' then usd_equiv::float * (1/(total_usd::float / - total_base::float) - 1/avg_px::float) else 0. end as realized_pnl_native
+        from closed_trades where idx = 1
+
+    UNION ALL
+    
+    SELECT rec.idx + 1, closed_trades._id, closed_trades.algorithm_service_name, closed_trades.isin, closed_trades.instrument_type, closed_trades.total_usd, closed_trades.total_base,
+        case when closed_trades.instrument_type like '%Spot%' then 
+            -1. * closed_trades.base_equiv::float * (closed_trades.avg_px::float - (- closed_trades.total_usd::float + rec.realized_pnl_usd) / closed_trades.total_base::float) + rec.realized_pnl_usd 
+            else 0. 
+            end as realized_pnl_usd,
+        case when closed_trades.instrument_type like '%Futures%' then 
+            closed_trades.usd_equiv::float * (1/(closed_trades.total_usd::float / (- closed_trades.total_base::float + rec.realized_pnl_native)) - 1/closed_trades.avg_px::float) + rec.realized_pnl_native 
+            else 0. 
+            end as realized_pnl_native
+    from rec join closed_trades on (rec.idx + 1 = closed_trades.idx and rec.algorithm_service_name = closed_trades.algorithm_service_name and rec.isin = closed_trades.isin)
+    
+    ) 
+    
+    select * from rec),
+  
+
+------- SUMMARY
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+BUILD as
+(select isin,
+    algorithm_service_name, 
+    sum(cum_qty::float) as quantity, 
+    case when isin like 'BINANCECM%' then sum(cum_qty::float * {{contract_mult}}. / avg_px::float) else sum(cum_qty::float) end as notional_native,
+    case when isin like 'BINANCECM%' then concat({{coin}}, '/USD') else {{coin}} end as coin,
+    sum(fees_tmp::float) as trading_fees,
+    instrument_type,
+    case
+        when (algorithm_service_name like '%h1%' and isin like 'BINANCECM%') then 'March 26, 2021'
+        when (algorithm_service_name like '%m1%' and isin like 'BINANCECM%') then 'June 25, 2021'
+        when (algorithm_service_name like '%u1%' and isin like 'BINANCECM%') then 'September 24, 2021'
+    end as expiration_date,
+    case when isin like 'BINANCECM%' then 0. else sum(-1. * cum_qty::float * avg_px::float) end as net_proceeds,
+    case when isin like 'BINANCECM%' then {{mark_fut}} else {{mark_spot}} end as mark_price
+from trades
+group by isin, algorithm_service_name, instrument_type
+order by isin, algorithm_service_name),
+
+
+
+----- DEV
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+-- ENTRY PRICE WRONG **  (cant just look at closed trades for entry ... only for realized)
+-- expected
+--      BINANCE_BTCUSDT    :: 59,837.047
+--      BINANCECM_BTCUSDM1 :: 63,139.084
+--      BLOCKCHAIN_BTCUSD  :: 57,754.834
+
+-- merge realized_pnl back into trades tape based on period
+-- at this point will be able to calc entry price for every day 
+-- error now : only doing entry price over closed trades
+
+-- IF NOT REALIZED_PNL :
+--      algo does not show up in closed_trades ... 
+--      (should still have entry price!)
+
+-- using solution above ... should just be 0 here if no realized_pnl
+
+
+-- ffill total_usd
+-- compute entry price in this frame
+-- REMOVE BUILD2, entry_price_last, realized_pnl_last, entry_price sub-queries
+
+
+test as (
+select t._id, t.period, t.algorithm_service_name, t.isin, t.instrument_type, t.cum_qty, t.avg_px, t.fees_tmp, t.usd_equiv, t.base_equiv, 
+    t.total_usd_tmp, t.total_base_tmp, r.realized_pnl_usd, r.realized_pnl_native, 
+    sum(case when r.realized_pnl_usd is not null then 1. end) over (partition by t.algorithm_service_name, t.isin order by t._id) as grp_fill
+from trades t
+    left join realized_pnl r
+    on t._id = r._id
+order by t._id),
+-- where _id > 15484965
+
+
+test2 as 
+(select *, 
+    case when instrument_type like '%Spot%' then (-total_usd_tmp + realized_pnl_usd) / total_base_tmp
+         when instrument_type like '%Futures%' then total_usd_tmp / (-total_base_tmp + realized_pnl_native)
+    end as entry_price
+
+from
+(select _id, period, algorithm_service_name, isin, instrument_type, cum_qty, avg_px, fees_tmp, usd_equiv, base_equiv, total_usd_tmp, total_base_tmp,
+case when rpnl_usd_tmp is null then 0. else rpnl_usd_tmp end as realized_pnl_usd, 
+case when rpnl_native_tmp is null then 0. else rpnl_native_tmp end as realized_pnl_native
+from
+-- 1) ffill realized_pnl
+-- 2) case when null fill with 0 for rpnl
+(select _id, period, algorithm_service_name, isin, instrument_type, cum_qty, avg_px, fees_tmp, usd_equiv, base_equiv, total_usd_tmp, total_base_tmp,
+    first_value(realized_pnl_usd) over (partition by algorithm_service_name, isin, grp_fill order by _id) as rpnl_usd_tmp,
+    first_value(realized_pnl_native) over (partition by algorithm_service_name, isin, grp_fill order by _id) as rpnl_native_tmp
+from test
+order by _id) as ffill_realized) as fill_nulls)
+
+
+
+
+select b.isin, b.algorithm_service_name, b.quantity, b.notional_native, b.coin, b.trading_fees, b.instrument_type, b.expiration_date, b.net_proceeds, b.mark_price, tmp.realized_pnl_usd, tmp.realized_pnl_native, tmp.entry_price
+from BUILD b
+join (select distinct on (algorithm_service_name, isin) algorithm_service_name, isin, realized_pnl_usd, realized_pnl_native, entry_price from test2 order by algorithm_service_name, isin, _id desc) tmp
+    on (b.isin = tmp.isin and b.algorithm_service_name = tmp.algorithm_service_name)
+
+
