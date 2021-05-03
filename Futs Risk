@@ -1,30 +1,35 @@
 -- NEXT GEN
 
+-- split risk_flat_price into 2 columns, one for BTC and one for ETH
 -- rename total_usd_tmp to total_usd , total_base_tmp to total_base
+-- add USDT as coin
 -- unrealised pnl spot when position is closed out
-
--- changes
---     flipped base_equiv
---     added else 0. for fees_tmp
 
 
 with trades as
-( select _id, period, algorithm_service_name, isin, instrument_type, cum_qty, avg_px, fees_tmp, usd_equiv, base_equiv,
+( select _id, period, algorithm_service_name, isin, instrument_type, contract_mult, cum_qty, avg_px, fees_tmp, usd_equiv, base_equiv,
     sum(usd_equiv) over (partition by algorithm_service_name, isin order by _id) as total_usd_tmp, 
     sum(base_equiv) over (partition by algorithm_service_name, isin order by _id) as total_base_tmp
     
 from ( select _id, to_timestamp(created_at/1000000) as period, algorithm_service_name, isin,
-    case when isin like 'BINANCECM%' then 'Futures' else 'Spot' end as instrument_type,
+    instrument_type,
+    contract_mult,
     cum_qty, avg_px, 
     -- Binance futs: 4 taker (native)
     -- Binance spot: 7.5 taker (usd)
-    case when isin like 'BINANCECM%' then .0004 * (abs(cum_qty::float) * {{contract_mult}} / avg_px::float) when isin like 'BINANCE%' then .00075 * abs(cum_qty::float) * avg_px::float else 0. end as fees_tmp,
-    case when isin like 'BINANCECM%' then -1. * cum_qty::float * {{contract_mult}} else -1. * cum_qty::float * avg_px::float end as usd_equiv, 
-    case when isin like 'BINANCECM%' then cum_qty::float * {{contract_mult}} / avg_px::float else cum_qty::float end as base_equiv
-from "liquidity_order_gateway"."order" 
+    case when isin like 'BINANCECM%' then .0004 * (abs(cum_qty::float) * contract_mult / avg_px::float) when isin like 'BINANCE%' then .00075 * abs(cum_qty::float) * avg_px::float else 0. end as fees_tmp,
+    case when isin like 'BINANCECM%' then -1. * cum_qty::float * contract_mult else -1. * cum_qty::float * avg_px::float end as usd_equiv, 
+    case when isin like 'BINANCECM%' then cum_qty::float * contract_mult / avg_px::float else cum_qty::float end as base_equiv
+-- ADD CONTRACT MULT
+from (select *, case when (instrument_type like '%Futures%' and algorithm_service_name like '%btcusd%') then 100. when (instrument_type like '%Futures%' and algorithm_service_name like '%ethusd%') then 10. end as contract_mult
+-- ADD FUTURES VENUE
+from (select *, case when isin like 'BINANCECM%' then 'Futures' else 'Spot' end as instrument_type from "liquidity_order_gateway"."order") as add_instrument) as contract_mult
+
+-- from "liquidity_order_gateway"."order"
 where cum_qty::float <> 0 
-    and (algorithm_service_name like '%liquidity-algo-basis-btcusd-m1-bin' 
-        or algorithm_service_name like '%liquidity-algo-basis-btcusd-u1-binancecm')
+    and (algorithm_service_name like '%liquidity-algo-basis-btcusd-m1-bin'
+        or algorithm_service_name like '%liquidity-algo-basis-btcusd-u1-binancecm'
+        or algorithm_service_name like '%liquidity-algo-basis-ethusd-m1-binancecm')
     [[and to_timestamp(created_at/1000000) > to_timestamp({{start_date}}, 'Month DD, YYYY HH24:MI')]]
     [[and to_timestamp(created_at/1000000) < to_timestamp({{end_date}}, 'Month DD, YYYY HH24:MI')]]
 order by period) as src ),
@@ -75,65 +80,53 @@ realized_pnl as (   with RECURSIVE rec AS (
     select * from rec),
   
 
-------- SUMMARY
+------- BUILD
 --------------------------------------------------------------------------------------------------------------------------------------------------------
 --------------------------------------------------------------------------------------------------------------------------------------------------------
 --------------------------------------------------------------------------------------------------------------------------------------------------------
 --------------------------------------------------------------------------------------------------------------------------------------------------------
 --------------------------------------------------------------------------------------------------------------------------------------------------------
-
 
 BUILD as
 (select isin,
     algorithm_service_name, 
     sum(cum_qty::float) as quantity, 
-    case when isin like 'BINANCECM%' then sum(cum_qty::float * {{contract_mult}}. / avg_px::float) else sum(cum_qty::float) end as notional_native,
-    case when isin like 'BINANCECM%' then concat({{coin}}, '/USD') else {{coin}} end as coin,
+    case when isin like '%Futures%' then sum(cum_qty::float * contract_mult / avg_px::float) else sum(cum_qty::float) end as notional_native,
+    case 
+        when (instrument_type like '%Futures%' and algorithm_service_name like '%btcusd%') then 'BTC/USD' 
+        when (instrument_type like '%Futures%' and algorithm_service_name like '%ethusd%') then 'ETH/USD'
+        when (instrument_type like '%Spot%' and algorithm_service_name like '%btcusd%') then 'BTC'
+        when (instrument_type like '%Spot%' and algorithm_service_name like '%ethusd%') then 'ETH'
+    end as coin,
     sum(fees_tmp::float) as trading_fees,
     instrument_type,
+    avg(contract_mult::float) as contract_mult, -- HACK
     case
         when (algorithm_service_name like '%h1%' and isin like 'BINANCECM%') then 'March 26, 2021'
         when (algorithm_service_name like '%m1%' and isin like 'BINANCECM%') then 'June 25, 2021'
         when (algorithm_service_name like '%u1%' and isin like 'BINANCECM%') then 'September 24, 2021'
     end as expiration_date,
     case when isin like 'BINANCECM%' then 0. else sum(-1. * cum_qty::float * avg_px::float) end as net_proceeds,
-    case when isin like 'BINANCECM%' then {{mark_fut}} else {{mark_spot}} end as mark_price
+    case 
+        when (instrument_type like '%Futures%' and algorithm_service_name like '%btcusd-m1%') then {{mark_fut_btc_m1}}
+        when (instrument_type like '%Futures%' and algorithm_service_name like '%btcusd-u1%') then {{mark_fut_btc_u1}}
+        when (instrument_type like '%Futures%' and algorithm_service_name like '%ethusd-m1%') then {{mark_fut_eth_m1}}
+        when (instrument_type like '%Spot%' and algorithm_service_name like '%btcusd%') then {{mark_spot_btc}}
+        when (instrument_type like '%Spot%' and algorithm_service_name like '%ethusd%') then {{mark_spot_eth}}
+    end as mark_price,
+    -- This is just a reference column , so that we're able to reference spot price when doing risk / pnl calculations on future
+    case 
+        when (instrument_type like '%Futures%' and algorithm_service_name like '%btcusd%') then {{mark_spot_btc}}
+        when (instrument_type like '%Futures%' and algorithm_service_name like '%ethusd%') then {{mark_spot_eth}}
+    end as mark_spot_equiv
+    
 from trades
 group by isin, algorithm_service_name, instrument_type
 order by isin, algorithm_service_name),
 
 
-
------ DEV
---------------------------------------------------------------------------------------------------------------------------------------------------------
---------------------------------------------------------------------------------------------------------------------------------------------------------
---------------------------------------------------------------------------------------------------------------------------------------------------------
-
-
-
--- ENTRY PRICE WRONG **  (cant just look at closed trades for entry ... only for realized)
--- expected
---      BINANCE_BTCUSDT    :: 59,837.047
---      BINANCECM_BTCUSDM1 :: 63,139.084
---      BLOCKCHAIN_BTCUSD  :: 57,754.834
-
--- merge realized_pnl back into trades tape based on period
--- at this point will be able to calc entry price for every day 
--- error now : only doing entry price over closed trades
-
--- IF NOT REALIZED_PNL :
---      algo does not show up in closed_trades ... 
---      (should still have entry price!)
-
--- using solution above ... should just be 0 here if no realized_pnl
-
-
--- ffill total_usd
--- compute entry price in this frame
--- REMOVE BUILD2, entry_price_last, realized_pnl_last, entry_price sub-queries
-
-
-test as (
+-- Merge reazlized pnl calcs to original trade tape
+setup_ffill_group as (
 select t._id, t.period, t.algorithm_service_name, t.isin, t.instrument_type, t.cum_qty, t.avg_px, t.fees_tmp, t.usd_equiv, t.base_equiv, 
     t.total_usd_tmp, t.total_base_tmp, r.realized_pnl_usd, r.realized_pnl_native, 
     sum(case when r.realized_pnl_usd is not null then 1. end) over (partition by t.algorithm_service_name, t.isin order by t._id) as grp_fill
@@ -143,11 +136,11 @@ from trades t
 order by t._id),
 -- where _id > 15484965
 
-
-test2 as 
+ffill_realized_pnl as 
 (select *, 
-    case when instrument_type like '%Spot%' then (-total_usd_tmp + realized_pnl_usd) / total_base_tmp
-         when instrument_type like '%Futures%' then total_usd_tmp / (-total_base_tmp + realized_pnl_native)
+    case when (instrument_type like '%Spot%' and total_base_tmp>0) then (-total_usd_tmp + realized_pnl_usd) / total_base_tmp
+         when (instrument_type like '%Futures%' and -total_base_tmp + realized_pnl_native > 0) then total_usd_tmp / (-total_base_tmp + realized_pnl_native)
+         else 0.
     end as entry_price
 
 from
@@ -160,15 +153,121 @@ from
 (select _id, period, algorithm_service_name, isin, instrument_type, cum_qty, avg_px, fees_tmp, usd_equiv, base_equiv, total_usd_tmp, total_base_tmp,
     first_value(realized_pnl_usd) over (partition by algorithm_service_name, isin, grp_fill order by _id) as rpnl_usd_tmp,
     first_value(realized_pnl_native) over (partition by algorithm_service_name, isin, grp_fill order by _id) as rpnl_native_tmp
-from test
-order by _id) as ffill_realized) as fill_nulls)
+from setup_ffill_group
+order by _id) as ffill_realized) as fill_nulls),
 
 
-
-
-select b.isin, b.algorithm_service_name, b.quantity, b.notional_native, b.coin, b.trading_fees, b.instrument_type, b.expiration_date, b.net_proceeds, b.mark_price, tmp.realized_pnl_usd, tmp.realized_pnl_native, tmp.entry_price
+BUILD_DONE as (
+select b.isin, b.algorithm_service_name, b.quantity, b.notional_native, b.coin, b.trading_fees, b.instrument_type, b.contract_mult,
+        b.expiration_date, b.net_proceeds, b.mark_price, b.mark_spot_equiv, tmp.realized_pnl_usd, tmp.realized_pnl_native, tmp.entry_price
 from BUILD b
-join (select distinct on (algorithm_service_name, isin) algorithm_service_name, isin, realized_pnl_usd, realized_pnl_native, entry_price from test2 order by algorithm_service_name, isin, _id desc) tmp
-    on (b.isin = tmp.isin and b.algorithm_service_name = tmp.algorithm_service_name)
+join (
+-- select most recent realized_pnl and entry price
+select distinct on (algorithm_service_name, isin) algorithm_service_name, isin, realized_pnl_usd, realized_pnl_native, entry_price 
+from ffill_realized_pnl order by algorithm_service_name, isin, _id desc) tmp
+    on (b.isin = tmp.isin and b.algorithm_service_name = tmp.algorithm_service_name)),
+    
+ 
+
+------- BOOK
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------   
+    
+spot_balances as (
+select isin, algorithm_service_name, quantity, quantity as notional_native, coin, 0. as trading_fees, instrument_type, cast(null as float) as contract_mult, null as expiration_date, 
+    0. as net_proceeds, mark_price, cast(null as float) as mark_spot_equiv, 0. as realized_pnl_usd, 0. as realized_pnl_native, cast(null as float) as entry_price
+from 
+    -- Binance native spot = collateral + realised Pnl (futs) - trading fees native
+    -- Blockchain usd spot = blockchain usd loan - money spent
+    -- Binance usd spot = binance usd loan - money spent - trading fees usd
+(select isin, algorithm_service_name, 
+        case 
+        when isin like 'BINANCECM%' then {{btc_payable}} + realized_pnl_native - trading_fees
+        when isin like 'BLOCKCHAIN%' then {{usd_payable}} + net_proceeds
+        when (isin like 'BINANCE%' and instrument_type like '%Spot%') then {{bin_usd_payable}} + (net_proceeds - trading_fees)
+    end as quantity,
+    -- spot balance is base for futures (ie, 'BTC' for 'BTC/USD' future), and USD for spot balances
+    case when instrument_type like 'Futures' then split_part(coin, '/', 1) else 'USD' end as coin,
+    -- spot balance is mark spot for future (collateral), or 1. because all other spot is USD
+    case when instrument_type like 'Futures' then mark_spot_equiv else 1. end as mark_price,
+    -- set all instrument types as 'spot'
+    'Spot' as instrument_type
+from BUILD_DONE) as init),
+
+
+-- OPTION TO EXCLUDE LOANS (FOR ME)
+BOOK as 
+(select isin, algorithm_service_name, quantity, notional_native, 
+    case 
+        when instrument_type like '%Futures%'then quantity * contract_mult
+        when coin like '%USD%' then quantity 
+        when (coin like '%BTC%' or coin like '%ETH%') then quantity * mark_price
+    end as notional_usd_equiv ,
+    coin, trading_fees, instrument_type, expiration_date, entry_price, mark_price, mark_spot_equiv, realized_pnl_usd, realized_pnl_native
+from (select * from BUILD_DONE union all select * from spot_balances) as tmp), --  union all select * from loan_balances
+
+------- RISK
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------   
+    
+RISK as (select *,
+case when (instrument_type like '%Futures%')
+    then (mark_spot_equiv * exp((ln(mark_price/mark_spot_equiv)/time_to_expiry + .01) * time_to_expiry) - mark_price) * risk_flat_price else 0. end as risk_implied_yield,
+case when (instrument_type like '%Futures%')
+    then (mark_spot_equiv * exp((ln(mark_price/mark_spot_equiv)/time_to_expiry) * (time_to_expiry-1./365.)) - mark_price) * risk_flat_price else 0. end as risk_theta_rolldown
+
+from (
+select *, 
+case 
+    when (instrument_type like '%Futures%' and entry_price <> 0) then (notional_usd_equiv * (1./entry_price - 1./mark_price) - notional_usd_equiv * (1./entry_price - 1./(mark_price-1.))) * mark_price + unrealized_pnl_native 
+    when (instrument_type like '%Futures%' and entry_price = 0) then 0. 
+    when coin like '%USD%' then 0.
+    else quantity
+end as risk_flat_price 
+
+from (select *,
+case when (instrument_type like '%Futures%' and entry_price <> 0) then notional_usd_equiv * (1./entry_price - 1./mark_price) else 0. end as unrealized_pnl_native,
+case when (instrument_type like '%Spot%' and coin not like '%USD%') then notional_native * (mark_price - entry_price) else 0. end as unrealized_pnl_usd,
+case when (instrument_type like '%Futures%' and (extract(day from to_timestamp(expiration_date, 'Month DD YYYY') - now()) + 1) / 365. > 0)
+        then (extract(day from to_timestamp(expiration_date, 'Month DD YYYY') - now()) + 1) / 365. else null end as time_to_expiry,
+-- Present_value_m2m
+-- futs open = unrealised Pnl native * mark spot
+-- futs closed = 0
+-- spot = quantity * mark spot 
+case when (instrument_type like '%Futures%' and entry_price <> 0) then notional_usd_equiv::float * (1./entry_price::float - 1./mark_price::float) * mark_spot_equiv
+     when (instrument_type like '%Futures%' and entry_price = 0) then 0.
+     else notional_usd_equiv 
+     end as pv_m2m_usd
+from BOOK) as setup_adv) as risk_flat),
+
+----------------------------------------------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------------------------------------------------
+end_ex_sum as (
+select isin, algorithm_service_name, quantity, notional_native, coin, instrument_type, expiration_date, time_to_expiry, entry_price, mark_price,
+        unrealized_pnl_native, unrealized_pnl_usd, realized_pnl_native, realized_pnl_usd, risk_flat_price, risk_implied_yield, risk_theta_rolldown, pv_m2m_usd from RISK 
+        order by instrument_type, expiration_date, algorithm_service_name, pv_m2m_usd desc),
+
+total_row as (select 'TOTAL' as isin, '' as algorithm_service_name, cast(null as float) as quantity, cast(null as float) as notional_native, '' as coin, '' as instrument_type, '' as expiration_date, 
+    cast(null as float) as time_to_expiry, cast(null as float) as entry_price, cast(null as float) as mark_price, 
+    cast(null as float) as unrealized_pnl_native, sum(unrealized_pnl_usd::float) as unrealized_pnl_usd, cast(null as float) as realized_pnl_native, sum(realized_pnl_usd::float) as realized_pnl_usd, 
+    sum(risk_flat_price::float) as risk_flat_price, sum(risk_implied_yield::float) as risk_implied_yield, sum(risk_theta_rolldown::float) as risk_theta_rolldown, sum(pv_m2m_usd::float) as pv_m2m_usd from RISK),
+    
+the_end as (select * from end_ex_sum union all select * from total_row)
+    
+
+-- merge BINANCECM_BTCUSDM1 and BINANCECM_BTCUSDU1
+
+-- add eth service 
+--      collateral (eth_payable --> collateral at Binance)
+--      condition where date > Apr 1 , for eth 0625
+
+select * from the_end
+
 
 
