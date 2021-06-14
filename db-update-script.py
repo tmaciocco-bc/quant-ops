@@ -1,21 +1,30 @@
 
 import time
+# import pandas as pd
 
 # virtualenv enviroment_name -p python3
 
 SECURITY_EXCHANGE = {
+    "BINANCECM": "S",
     "BINANCEUS": "M",
     "BITFINEX": "G",
     "BLOCKCHAIN": "E",
+    "COINBASE": "N",
     "CUMBERLAND": "J",
+    "GALAXY": "R",
     "LMAX": "K",
+    "BINANCE": "F"
 }
 
 TRADING_GATEWAY = {
+    "BINANCE": "liquidity-trading-gateway-binance",
+    "BINANCECM": "liquidity-trading-gateway-binance-cm",
     "BINANCEUS": "liquidity-trading-gateway-binance-us",
     "BITFINEX": "liquidity-trading-gateway-bitfinex",
     "BLOCKCHAIN": "liquidity-trading-gateway-blockchain",
+    "COINBASE": "liquidity-trading-gateway-coinbase",
     "CUMBERLAND": "liquidity-hybrid-gateway-cumberland",
+    "GALAXY": "liquidity-trading-gateway-galaxy",
     "LMAX": "liquidity-trading-gateway-lmax-fx",
 }
 
@@ -133,7 +142,7 @@ def write_db_procedures(procedure_type, client_order_id, algo_service_name, isin
 
 
 if __name__ == "__main__":
-    print(write_db_procedures(procedure_type="",
+    print(write_db_procedures(procedure_type="insert_order",
                         client_order_id="",
                         algo_service_name="",
                         isin="",
@@ -142,10 +151,10 @@ if __name__ == "__main__":
                         avg_px=0,
                         cum_qty=0,
                         leaves_qty=0,
-                        created_at=0,
+                        created_at=int(time.time() * 1e6),
                         # updated_at=1611248896201110,
-                        exchange_client_order_id="",
-                        order_id="",
-                        tif=0,
-                        order_status=0,
+                        exchange_client_order_id='',
+                        order_id='UNKNOWN',
+                        tif=3,
+                        order_status=5,
                         reason=""))
